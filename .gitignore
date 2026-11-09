@@ -1,14 +1,11 @@
-# secrets and local config
+# revert files written by the tool
+swap-*.json
+
+# secrets
 .env
 *.env
-!examples/env.example
-targets.toml
-!examples/targets.example.toml
-*token*.txt
 *.pem
 *.key
-swap-*.json
-*.sha256
 
 # python / editors
 __pycache__/

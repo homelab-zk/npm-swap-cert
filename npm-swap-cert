@@ -5,14 +5,13 @@ Needs an NPM ADMIN login (prompted, never stored or printed). Dry run by
 default. Only hosts whose domains are ALL covered by the new certificate are
 changed. Handles proxy, redirection and 404 hosts (streams are skipped).
 
-  npm-swap-cert --npm main --url http://npm.example.lan:81 --list
-  npm-swap-cert --npm main --url http://npm.example.lan:81 --from 5 --to 32            # dry run
-  npm-swap-cert --npm main --url http://npm.example.lan:81 --from 5 --to 32 --apply --limit 1
-  npm-swap-cert --npm main --url http://npm.example.lan:81 --from 5 --to 32 --apply
-  npm-swap-cert --npm main --url http://npm.example.lan:81 --revert <revert-file>.json
+  npm-swap-cert --url http://npm.example.lan:81 --list
+  npm-swap-cert --url http://npm.example.lan:81 --from 5 --to 32            # dry run
+  npm-swap-cert --url http://npm.example.lan:81 --from 5 --to 32 --apply --limit 1
+  npm-swap-cert --url http://npm.example.lan:81 --from 5 --to 32 --apply
+  npm-swap-cert --url http://npm.example.lan:81 --revert <revert-file>.json
 
---npm is a label for the NPM instance. It names the revert file and, without --url,
-selects NPM_<LABEL>_URL from the env file.
+--npm is an optional label for the NPM instance; it only names the revert file.
 """
 import argparse
 import getpass
@@ -24,22 +23,8 @@ import time
 import urllib.error
 import urllib.request
 
-DEFAULT_ENV = "/etc/certwarden-push/env"
-STATE_DIR = "/var/lib/certwarden-push"
+STATE_DIR = "."
 KINDS = {"proxy": "proxy-hosts", "redirect": "redirection-hosts", "404": "dead-hosts"}
-
-
-def load_env(path):
-    env = {}
-    for line in open(path):
-        line = line.rstrip("\n")
-        if line.strip() and not line.lstrip().startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            v = v.strip()
-            if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
-                v = v[1:-1]
-            env[k.strip()] = v
-    return env
 
 
 def api(base, method, path, token=None, payload=None):
@@ -69,23 +54,18 @@ def covered(domain, cert_names):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--npm", required=True, help="label for this NPM instance (names the revert file)")
+    ap.add_argument("--url", required=True, help="NPM base URL, e.g. http://npm.example.lan:81")
+    ap.add_argument("--npm", default="npm", help="label for this NPM instance (names the revert file)")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--from", dest="old", type=int)
     ap.add_argument("--to", dest="new", type=int)
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--revert")
-    ap.add_argument("--url", help="NPM base URL, e.g. http://npm.example.lan:81 (skips the env file)")
-    ap.add_argument("--env", default=DEFAULT_ENV, help="env file used to look up NPM_<LABEL>_URL when --url is not given")
-    ap.add_argument("--state-dir", help="where to write the revert file (default /var/lib/certwarden-push)")
+    ap.add_argument("--state-dir", help="where to write the revert file (default: current directory)")
     a = ap.parse_args()
 
-    if a.url:
-        base = a.url.rstrip("/")
-    else:
-        label = re.sub(r"[^A-Za-z0-9]", "_", a.npm).upper()
-        base = load_env(a.env)[f"NPM_{label}_URL"].rstrip("/")
+    base = a.url.rstrip("/")
     global STATE_DIR
     if a.state_dir:
         STATE_DIR = a.state_dir
