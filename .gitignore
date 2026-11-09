@@ -1,0 +1,19 @@
+# secrets and local config
+.env
+*.env
+!examples/env.example
+targets.toml
+!examples/targets.example.toml
+*token*.txt
+*.pem
+*.key
+swap-*.json
+*.sha256
+
+# python / editors
+__pycache__/
+*.pyc
+venv/
+.venv/
+.idea/
+.vscode/

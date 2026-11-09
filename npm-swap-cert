@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""One-off helper: move NPM hosts from one certificate to another.
+
+Needs an NPM ADMIN login (prompted, never stored or printed). Dry run by
+default. Only hosts whose domains are ALL covered by the new certificate are
+changed. Handles proxy, redirection and 404 hosts (streams are skipped).
+
+  npm-swap-cert --npm main --url http://npm.example.lan:81 --list
+  npm-swap-cert --npm main --url http://npm.example.lan:81 --from 5 --to 32            # dry run
+  npm-swap-cert --npm main --url http://npm.example.lan:81 --from 5 --to 32 --apply --limit 1
+  npm-swap-cert --npm main --url http://npm.example.lan:81 --from 5 --to 32 --apply
+  npm-swap-cert --npm main --url http://npm.example.lan:81 --revert <revert-file>.json
+
+--npm is a label for the NPM instance. It names the revert file and, without --url,
+selects NPM_<LABEL>_URL from the env file.
+"""
+import argparse
+import getpass
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+
+DEFAULT_ENV = "/etc/certwarden-push/env"
+STATE_DIR = "/var/lib/certwarden-push"
+KINDS = {"proxy": "proxy-hosts", "redirect": "redirection-hosts", "404": "dead-hosts"}
+
+
+def load_env(path):
+    env = {}
+    for line in open(path):
+        line = line.rstrip("\n")
+        if line.strip() and not line.lstrip().startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                v = v[1:-1]
+            env[k.strip()] = v
+    return env
+
+
+def api(base, method, path, token=None, payload=None):
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(base + path, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read() or b"null")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read())
+        except ValueError:
+            return e.code, {}
+
+
+def covered(domain, cert_names):
+    for n in cert_names:
+        if n == domain:
+            return True
+        if n.startswith("*.") and domain.endswith(n[1:]) and domain.count(".") == n.count("."):
+            return True
+    return False
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--npm", required=True, help="label for this NPM instance (names the revert file)")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--from", dest="old", type=int)
+    ap.add_argument("--to", dest="new", type=int)
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--limit", type=int)
+    ap.add_argument("--revert")
+    ap.add_argument("--url", help="NPM base URL, e.g. http://npm.example.lan:81 (skips the env file)")
+    ap.add_argument("--env", default=DEFAULT_ENV, help="env file used to look up NPM_<LABEL>_URL when --url is not given")
+    ap.add_argument("--state-dir", help="where to write the revert file (default /var/lib/certwarden-push)")
+    a = ap.parse_args()
+
+    if a.url:
+        base = a.url.rstrip("/")
+    else:
+        label = re.sub(r"[^A-Za-z0-9]", "_", a.npm).upper()
+        base = load_env(a.env)[f"NPM_{label}_URL"].rstrip("/")
+    global STATE_DIR
+    if a.state_dir:
+        STATE_DIR = a.state_dir
+    print(f"NPM instance: {a.npm} ({base})")
+    ident = input("NPM ADMIN email: ").strip()
+    secret = getpass.getpass("NPM ADMIN password: ")
+    code, body = api(base, "POST", "/api/tokens", payload={"identity": ident, "secret": secret})
+    token = body.get("token") if isinstance(body, dict) else None
+    secret = None
+    if not token:
+        sys.exit(f"login failed (HTTP {code})")
+
+    code, certs = api(base, "GET", "/api/nginx/certificates", token)
+    by_id = {c["id"]: c for c in certs}
+    hosts = []
+    for kind, path in KINDS.items():
+        code, items = api(base, "GET", "/api/nginx/" + path, token)
+        for h in items if isinstance(items, list) else []:
+            hosts.append((kind, path, h))
+
+    if a.list:
+        print("\nCertificates (id, name, provider, domains, expires) and how many hosts use each:")
+        for cid, c in sorted(by_id.items()):
+            n = sum(1 for _, _, h in hosts if h.get("certificate_id") == cid)
+            print(f"  {cid:>4}  {c.get('nice_name')!s:32} {c.get('provider'):12} {c.get('domain_names')} {c.get('expires_on')}  used by {n}")
+        return
+
+    if a.revert:
+        saved = json.load(open(a.revert))
+        for item in saved["changed"]:
+            c, _ = api(base, "PUT", f"/api/nginx/{item['path']}/{item['id']}", token, {"certificate_id": item["from"]})
+            print(f"revert {item['path']} {item['id']}: HTTP {c}")
+        return
+
+    if a.old is None or a.new is None or a.new not in by_id:
+        sys.exit("need --from OLD_ID and --to NEW_ID (see --list)")
+    names = by_id[a.new].get("domain_names", [])
+    print(f"\nNew certificate {a.new}: {by_id[a.new].get('nice_name')} {names}")
+    todo, skipped = [], []
+    for kind, path, h in hosts:
+        if h.get("certificate_id") != a.old:
+            continue
+        doms = h.get("domain_names", [])
+        (todo if all(covered(d, names) for d in doms) else skipped).append((kind, path, h))
+    print(f"hosts on old cert {a.old}: {len(todo) + len(skipped)}; swappable: {len(todo)}; not covered by new cert: {len(skipped)}")
+    for kind, path, h in skipped:
+        print(f"  SKIP  {kind:8} {h['id']:>4} {h.get('domain_names')}")
+    if a.limit:
+        todo = todo[: a.limit]
+    changed = []
+    for kind, path, h in todo:
+        if not a.apply:
+            print(f"  would swap {kind:8} {h['id']:>4} {h.get('domain_names')}")
+            continue
+        code, resp = api(base, "PUT", f"/api/nginx/{path}/{h['id']}", token, {"certificate_id": a.new})
+        ok = code == 200 and isinstance(resp, dict) and resp.get("certificate_id") == a.new
+        print(f"  {'OK  ' if ok else 'FAIL'} {kind:8} {h['id']:>4} {h.get('domain_names')} (HTTP {code})")
+        if ok:
+            changed.append({"path": path, "id": h["id"], "from": a.old})
+    if a.apply and changed:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        f = os.path.join(STATE_DIR, f"swap-{re.sub(r'[^A-Za-z0-9_.-]', '_', a.npm)}-{time.strftime('%Y%m%d-%H%M%S')}.json")
+        json.dump({"npm": a.npm, "changed": changed}, open(f, "w"))
+        print(f"\nrevert file: {f}")
+    if not a.apply:
+        print("\ndry run only; add --apply to make the change (try --limit 1 first)")
+
+
+if __name__ == "__main__":
+    main()
